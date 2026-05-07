@@ -22,14 +22,374 @@ from scipy.ndimage import rotate
 from scipy.optimize import curve_fit
 from scipy.interpolate import interp1d
 from scipy.interpolate import LSQUnivariateSpline
-from scipy.signal import medfilt, find_peaks, detrend
+from scipy.signal import medfilt, find_peaks, detrend, savgol_filter
 
 from lmfit.models import VoigtModel, ExponentialModel, SplineModel, LinearModel, GaussianModel, PolynomialModel, ConstantModel
-from lmfit import report_fit
+from lmfit import report_fit, Parameters, Minimizer
 
 from astroquery.simbad import Simbad
 
 import astroscrappy
+
+############################
+# Helper Functions
+############################
+
+def gaussian_1d(x, amp, mu, sigma, c):
+    return c + amp * np.exp(-0.5 * ((x - mu) / sigma)**2)
+
+
+def fit_gaussian_fwhm_profile(x, y, plot=False, title=None):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    good = np.isfinite(x) & np.isfinite(y)
+    x = x[good]
+    y = y[good]
+
+    if len(x) < 5:
+        raise ValueError("Too few valid points for Gaussian fit.")
+
+    c0 = np.nanmedian(y)
+    amp0 = np.nanmax(y) - c0
+    mu0 = x[np.nanargmax(y)]
+    sigma0 = max((x.max() - x.min()) / 6, 1.0)
+
+    p0 = [amp0, mu0, sigma0, c0]
+
+    bounds = (
+        [0, x.min(), 0, -np.inf],
+        [np.inf, x.max(), np.inf, np.inf]
+    )
+
+    popt, pcov = curve_fit(
+        gaussian_1d,
+        x,
+        y,
+        p0=p0,
+        bounds=bounds,
+        maxfev=10000
+    )
+
+    amp, mu, sigma, c = popt
+    sigma = abs(sigma)
+    fwhm = 2.354820045 * sigma
+
+    if plot:
+        xmodel = np.linspace(x.min(), x.max(), 500)
+        ymodel = gaussian_1d(xmodel, amp, mu, sigma, c)
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(x, y, 'o', label="Profile")
+        plt.plot(xmodel, ymodel, 'r-', label=f"Gaussian fit, FWHM={fwhm:.2f} pix")
+        plt.axvline(mu, color='k', linestyle='--', alpha=0.6)
+        plt.xlabel("Cross-dispersion pixel")
+        plt.ylabel("Flux")
+        if title is not None:
+            plt.title(title)
+        plt.grid(alpha=0.3)
+        plt.legend()
+        plt.show()
+
+    return {
+        "center": mu,
+        "sigma": sigma,
+        "fwhm": fwhm,
+        "amplitude": amp,
+        "continuum": c,
+        "popt": popt,
+        "pcov": pcov,
+    }
+
+def measure_trace_fwhm(
+    subim,
+    filter,
+    columns=None,
+    column_half_width=5,
+    profile_half_height=30,
+    plot_profiles=False,
+):
+    """
+    Measure cross-dispersion FWHM from a 2D trace cutout/subimage.
+
+    Returns
+    -------
+    mean_fwhm, median_fwhm, std_fwhm
+    """
+
+    img = np.asarray(subim, dtype=float)
+    ny, nx = img.shape
+
+    if columns is None:
+        columns = [2000, 2100, 2200, 2300, 2400, 2500, 2600] if filter == 'lrg' else [1800, 1900, 2000, 2100, 2200, 2300, 2400]
+
+    fwhms = []
+
+    for col in columns:
+        c1 = max(int(col - column_half_width), 0)
+        c2 = min(int(col + column_half_width + 1), nx)
+
+        profile = np.nanmedian(img[:, c1:c2], axis=1)
+        ypix = np.arange(ny)
+
+        if not np.any(np.isfinite(profile)):
+            continue
+
+        y0 = int(np.nanargmax(profile))
+        y1 = max(y0 - profile_half_height, 0)
+        y2 = min(y0 + profile_half_height + 1, ny)
+
+        try:
+            fit = fit_gaussian_fwhm_profile(
+                ypix[y1:y2],
+                profile[y1:y2],
+                plot=plot_profiles,
+                title=f"x pixel col={col}"
+            )
+            fwhms.append(fit["fwhm"])
+        except Exception:
+            continue
+
+    fwhms = np.asarray(fwhms, dtype=float)
+
+    if len(fwhms) == 0:
+        return np.nan, np.nan, np.nan
+
+    return np.nanmean(fwhms), np.nanmedian(fwhms), np.nanstd(fwhms)
+
+def voigt_centroid(
+        x,
+        y,
+        x0,
+        window=6,
+        window_try=None,
+        min_snr=3.0,
+        max_center_shift=None,
+        return_result=False,
+        debug=False
+    ):
+        """
+        Robust centroid of an absorption feature using Voigt + linear continuum.
+
+        Parameters
+        ----------
+        x, y : array-like
+            Spectrum coordinates and flux.
+        x0 : float
+            Initial guess for centroid.
+        window : int
+            Default half-window in x units if window_try is None.
+        window_try : list[int] or None
+            Candidate half-window sizes to try. Best acceptable fit is chosen.
+        min_snr : float
+            Minimum approximate line SNR required for accepting a Voigt fit.
+        max_center_shift : float or None
+            Maximum allowed |center - x0|. If None, defaults to ~0.75*window.
+        return_result : bool
+            If True, also return best lmfit result and diagnostics dict.
+        debug : bool
+            Print diagnostics.
+
+        Returns
+        -------
+        center : float
+        center_err : float
+        result : lmfit result, optional
+        info : dict, optional
+        """
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+
+        if window_try is None:
+            window_try = sorted(set([max(3, window-2), window, window+2, window+4]))
+
+        if max_center_shift is None:
+            max_center_shift = 0.75 * max(window_try)
+
+        best = None
+        best_score = np.inf
+        diagnostics = []
+
+        for w in window_try:
+            idx = np.argmin(np.abs(x - x0))
+            lo = max(idx - w, 0)
+            hi = min(idx + w + 1, len(x))
+
+            xfit = x[lo:hi]
+            yfit = y[lo:hi]
+
+            if len(xfit) < 7:
+                continue
+            if not np.all(np.isfinite(xfit)) or not np.all(np.isfinite(yfit)):
+                continue
+
+            dx = np.median(np.diff(xfit)) if len(xfit) > 2 else 1.0
+            if not np.isfinite(dx) or dx <= 0:
+                dx = 1.0
+
+            # approximate line depth / noise using edge pixels as pseudo-continuum
+            nedge = max(2, len(yfit) // 5)
+            edge_y = np.concatenate([yfit[:nedge], yfit[-nedge:]])
+            cont_med = np.median(edge_y)
+            noise = np.std(edge_y) if len(edge_y) > 1 else np.std(yfit)
+            noise = max(noise, 1e-12)
+
+            line_depth = cont_med - np.min(yfit)   # absorption depth
+            approx_snr = line_depth / noise
+
+            # absorption -> positive peak for Voigt
+            yinv = np.max(yfit) - yfit
+
+            voigt = VoigtModel(prefix='v_')
+            cont = LinearModel(prefix='c_')
+            model = voigt + cont
+
+            pars = model.make_params()
+            pars['v_center'].set(value=x0, min=xfit.min(), max=xfit.max())
+            pars['v_sigma'].set(value=max(1.5 * dx, 0.5 * dx), min=0.25 * dx, max=10 * dx)
+            pars['v_gamma'].set(value=max(1.5 * dx, 0.5 * dx), min=0.25 * dx, max=10 * dx)
+            pars['v_amplitude'].set(value=max(np.trapz(yinv, xfit), 1e-12), min=0)
+
+            # let continuum be guessed from inverted spectrum
+            pars.update(cont.guess(yinv, x=xfit))
+
+            try:
+                result = model.fit(
+                    yinv,
+                    pars,
+                    x=xfit,
+                    method='least_squares',
+                    fit_kws={'loss': 'soft_l1'}
+                )
+            except Exception:
+                continue
+
+            center = result.params['v_center'].value
+            center_err = result.params['v_center'].stderr
+            sigma = result.params['v_sigma'].value
+            gamma = result.params['v_gamma'].value
+
+            best_fit = result.best_fit
+            resid = yinv - best_fit
+            rms = np.sqrt(np.mean(resid**2))
+
+            # approximate reduced chi-like score
+            red_metric = np.mean((resid / noise)**2)
+
+            # fit acceptance
+            bad = False
+            if not np.isfinite(center):
+                bad = True
+            if abs(center - x0) > max_center_shift:
+                bad = True
+            if not np.isfinite(sigma) or not np.isfinite(gamma):
+                bad = True
+            if sigma < 0.2 * dx or gamma < 0.2 * dx:
+                bad = True
+            if approx_snr < min_snr:
+                bad = True
+
+            diagnostics.append({
+                "window": w,
+                "center": center,
+                "center_err": center_err,
+                "snr": approx_snr,
+                "rms": rms,
+                "red_metric": red_metric,
+                "accepted": not bad,
+            })
+
+            if bad:
+                continue
+
+            # prefer low residual and small center error
+            err_term = center_err if (center_err is not None and np.isfinite(center_err)) else 5 * dx
+            score = red_metric + 0.2 * (err_term / dx)
+
+            if score < best_score:
+                best_score = score
+                best = (center, err_term, result, {
+                    "window": w,
+                    "snr": approx_snr,
+                    "rms": rms,
+                    "red_metric": red_metric,
+                })
+
+        # fallback: weighted centroid around local absorption minimum
+        if best is None:
+            idx = np.argmin(np.abs(x - x0))
+            lo = max(idx - window, 0)
+            hi = min(idx + window + 1, len(x))
+
+            xfit = x[lo:hi]
+            yfit = y[lo:hi]
+
+            if len(xfit) < 3:
+                center = float(x0)
+                center_err = np.inf
+            else:
+                nedge = max(2, len(yfit) // 5)
+                edge_y = np.concatenate([yfit[:nedge], yfit[-nedge:]])
+                cont = np.median(edge_y)
+                weights = np.clip(cont - yfit, 0, None)  # absorption-only weights
+
+                if np.sum(weights) > 0:
+                    center = float(np.sum(xfit * weights) / np.sum(weights))
+                    center_err = float(np.std(xfit) / max(np.sqrt(np.sum(weights > 0)), 1))
+                else:
+                    center = float(xfit[np.argmin(yfit)])
+                    center_err = np.inf
+
+            if debug:
+                print(f"voigt_centroid fallback used at x0={x0:.2f}")
+
+            if return_result:
+                return center, center_err, None, {"fallback": True, "trials": diagnostics}
+            return center, center_err
+
+        center, center_err, result, info = best
+
+        if debug:
+            print(
+                f"voigt_centroid x0={x0:.2f} -> center={center:.3f}, "
+                f"err={center_err:.3f}, window={info['window']}, "
+                f"SNR={info['snr']:.2f}, red_metric={info['red_metric']:.3f}"
+            )
+
+        if return_result:
+            info["fallback"] = False
+            info["trials"] = diagnostics
+            return center, center_err, result, info
+
+        return center, center_err
+
+
+def double_gauss_linear_model(params, x):
+    c0 = params["c0"].value
+    c1 = params["c1"].value
+
+    cen1 = params["cen1"].value
+    sep = params["sep"].value
+    cen2 = cen1 + sep
+
+    sig1 = params["sig1"].value
+    sig2 = params["sig2"].value
+
+    amp1 = params["amp1"].value
+    amp2 = params["amp2"].value
+
+    x0 = np.nanmedian(x)
+    bkg = c0 + c1 * (x - x0)
+
+    g1 = amp1 * np.exp(-0.5 * ((x - cen1) / sig1) ** 2)
+    g2 = amp2 * np.exp(-0.5 * ((x - cen2) / sig2) ** 2)
+
+    return bkg + g1 + g2
+
+
+def double_gauss_linear_residual(params, x, y):
+    return double_gauss_linear_model(params, x) - y
 
     
 ############################
@@ -93,7 +453,7 @@ class spectrum:
         else:
             self.calib_spectrum = calib_spectrum
             self.wave_calib = calib_spectrum.wave_calib if calib_spectrum else None
-            self.gain_spline = calib_spectrum.gain_spline if calib_spectrum else None
+            self.gain_smooth = calib_spectrum.gain_smooth if calib_spectrum else None
 
         self.flagged = False
 
@@ -138,7 +498,7 @@ class spectrum:
         """
         Prints key parameters from the current instantiation.
         """
-        return self.object_name, self.obs_date, self.im, self.rotangle, self.box, self.wave_calib, self.gain_spline
+        return self.object_name, self.obs_date, self.im, self.rotangle, self.box, self.wave_calib, self.gain_smooth
 
     def remove_hot_pixels(self, readnoise = 3, niter=1, verbose=False):
         """
@@ -183,17 +543,17 @@ class spectrum:
 
         if self.filter == 'lrg':
             if self.camera == 'ASI Camer':
-                xmin = 1700
+                xmin = 1750
                 xmax = 3250
                 if ymin is None or ymax is None:
                     ymin = 1720
-                    ymax = 1850
+                    ymax = 1820
             if self.camera == 'QHYCCD-Ca':
                 xmin = 2000
                 xmax = 3250
                 if ymin is None or ymax is None:
                     ymin = 1600
-                    ymax = 1900
+                    ymax = 1850
 
         yvals = np.argmax(data[ymin:ymax, :], axis=0) + ymin
         xvals = np.arange(len(data[0]))
@@ -230,22 +590,73 @@ class spectrum:
             if self.camera == 'QHYCCD-Ca':
                 over = 60
                 under = 80
-            cutouts = np.array(
-                [
-                    data[int(yval) - under : int(yval) + over, ii]
-                    for yval, ii in zip(trace_center, xvals)
-                ]
-            )
+            # cutouts = np.array(
+            #     [
+            #         data[int(yval) - under : int(yval) + over, ii]
+            #         for yval, ii in zip(trace_center, xvals)
+            #     ]
+            # )
+            ny, nx = data.shape
+            height = under + over
+
+            cutouts = []
+
+            for yval, ii in zip(trace_center, xvals):
+                yc = int(round(yval))
+
+                y1 = yc - under
+                y2 = yc + over
+
+                col = np.full(height, np.nan)
+
+                src_y1 = max(y1, 0)
+                src_y2 = min(y2, ny)
+
+                dst_y1 = src_y1 - y1
+                dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+                if src_y2 > src_y1:
+                    col[dst_y1:dst_y2] = data[src_y1:src_y2, ii]
+
+                cutouts.append(col)
+
+            cutouts = np.array(cutouts)
 
         if self.filter == 'lrg':
             under = 35
             over = 55
-            cutouts = np.array(
-                [
-                    data[int(yval) - under : int(yval) + over, ii]
-                    for yval, ii in zip(trace_center, xvals)
-                ]
-            )
+            # cutouts = np.array(
+            #     [
+            #         data[int(yval) - under : int(yval) + over, ii]
+            #         for yval, ii in zip(trace_center, xvals)
+            #     ]
+            # )
+
+            ny, nx = data.shape
+            height = under + over
+
+            cutouts = []
+
+            for yval, ii in zip(trace_center, xvals):
+                yc = int(round(yval))
+
+                y1 = yc - under
+                y2 = yc + over
+
+                col = np.full(height, np.nan)
+
+                src_y1 = max(y1, 0)
+                src_y2 = min(y2, ny)
+
+                dst_y1 = src_y1 - y1
+                dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+                if src_y2 > src_y1:
+                    col[dst_y1:dst_y2] = data[src_y1:src_y2, ii]
+
+                cutouts.append(col)
+
+            cutouts = np.array(cutouts)
 
         self.trace_center = trace_center
         self.trace_model = fitted_polymodel
@@ -253,6 +664,8 @@ class spectrum:
 
         subim = cutouts.T
         self.subim = subim
+
+        self.mean_fwhm, self.median_fwhm, self.std_fwhm = measure_trace_fwhm(subim, filter=self.filter, plot_profiles=False)
 
         col_flux = np.sum(subim, axis=0)
         self.trace_x_center = float((xvals[-1]+xvals[0])/2.0)
@@ -570,14 +983,14 @@ class spectrum:
                     label=f"Hα ({wave} Å)"
                 )
                 ax.axvline(
-                    x = 6872.0, 
-                    label='Red Telluric Line (6872.0 Å)', 
+                    x = 6873.0, 
+                    label='Red Telluric Line (6873.0 Å)', 
                     color='darkred', 
                     linestyle='--'
                 )
                 ax.axvline(
-                    x = 6279.0, 
-                    label='Red Telluric Line (6279.0 Å)', 
+                    x = 6280.2, 
+                    label='Red Telluric Line (6280.2 Å)', 
                     color='blue', 
                     linestyle='--'
                 )
@@ -717,249 +1130,411 @@ class spectrum:
         extract_percent = center_percent + (edge_percent - center_percent) * frac
         return np.clip(extract_percent, 1, 100)
     
-    def fit_telluric(self, x_guess = None, recursion = None, offset = None, plot = False, debugging = False, manual_override = False):
+    def fit_telluric(
+        self,
+        x_guess=None,
+        window=None,
+        min_sep=None,
+        max_sep=None,
+        plot=False,
+        debugging=False,
+    ):
 
-        x = self.spectrum[0]
-        y = self.spectrum[1]
+        x = np.asarray(self.spectrum[0], dtype=float)
+        y = np.asarray(self.spectrum[1], dtype=float)
 
-        if manual_override:
+        if x_guess is None:
+            if self.camera == "ASI Camer":
+                x_guess = 3080 if self.filter == "hrg" else 3000
+            elif self.camera == "QHYCCD-Ca":
+                x_guess = 2970 if self.filter == "hrg" else 2960
+            else:
+                x_guess = 3000
 
-            self.telluric_pixel = x_guess
+        if window is None:
+            window = 150 if self.filter == "hrg" else 60
 
-            if self.filter == 'hrg':
-                mask = (self.spectrum[0] >= (self.telluric_pixel - 2500)) & (self.spectrum[0] <= 4500)
-                self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 2500)
-                self.amp_uncal_mask = self.spectrum[1][mask]
-            if self.filter == 'lrg':
-                mask = (self.spectrum[0] >= (self.telluric_pixel - 1550)) & (self.spectrum[0] <= 4500)
-                self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 1550)
-                self.amp_uncal_mask = self.spectrum[1][mask]
+        if min_sep is None:
+            min_sep = 5 if self.filter == "hrg" else 3
 
-            return self.telluric_pixel
+        if max_sep is None:
+            max_sep = 50 if self.filter == "hrg" else 10
 
+        mask = (
+            np.isfinite(x) &
+            np.isfinite(y) &
+            (x >= x_guess - window) &
+            (x <= x_guess + window)
+        )
 
-        if recursion is None:
-            recursion = 0
+        xfit = x[mask]
+        yfit = y[mask]
 
-        if self.camera == 'ASI Camer':
-            if self.filter == 'hrg':
-                x_guess = x_guess if x_guess else 3080
-                amp1, amp2 = -0.1, -0.1
-                mask = (x > x_guess - 150) & (x < x_guess + 150)
-            if self.filter == 'lrg':
-                x_guess = x_guess if x_guess else 3000
-                amp1, amp2 = -0.1, -0.1
-                mask = (x > x_guess - 80) & (x < x_guess + 80)
-        if self.camera == 'QHYCCD-Ca':
-            if self.filter == 'hrg':
-                x_guess = x_guess if x_guess else 2970
-                amp1, amp2 = -0.1, -0.1
-                mask = (x > x_guess - 150) & (x < x_guess + 150)
-            if self.filter == 'lrg':
-                x_guess = x_guess if x_guess else 2955
-                amp1, amp2 = -0.1, -0.1
-                mask = (x > x_guess - 60) & (x < x_guess + 60)
+        if len(xfit) < 10:
+            self.flagged = True
+            self.failure_reason = "Too few points in telluric fit window."
+            return None
 
-        x = x[mask]
-        y = y[mask]/np.max(y[mask])
+        norm_val = np.nanpercentile(yfit, 95)
+        if not np.isfinite(norm_val) or norm_val == 0:
+            norm_val = np.nanmedian(yfit)
 
-        if offset is None:
-            offset = 0
-        if recursion == 10:
-            # print('Did not detect feature leftward of initial guess')
-            offset = 0
-        if recursion > 20:
-            print("Recursion limit reached, unable to fit feature")
-            return
+        yfit = yfit / norm_val
 
-        # Define the left Gaussian (g1) model
-        gauss1 = GaussianModel(prefix='g1_')
-        pars = gauss1.make_params(center=x_guess + offset, sigma=5)
-        pars['g1_amplitude'].set(value=amp1, vary=True, max=0)
+        c0_guess = np.nanmedian(yfit)
+        c1_guess = 0.0
+        amp_guess = np.nanmin(yfit) - c0_guess
 
-        # Define the right Gaussian (g2) model
-        gauss2 = GaussianModel(prefix='g2_')
-        pars.update(gauss2.make_params(center=x_guess + 30 + offset, sigma=5))
-        pars['g2_amplitude'].set(value=amp2, vary=True, max=0)
+        params = Parameters()
+        params.add("c0", value=c0_guess, min=0.2, max=2.0)
+        params.add("c1", value=c1_guess, min=-0.05, max=0.05)
 
-        # Define the background model
-        bkg = LinearModel(prefix='bkg_')
-        pars.update(bkg.guess(y, x))
+        params.add("cen1", value=x_guess, min=xfit.min(), max=xfit.max())
+        params.add("sep", value=10, min=min_sep, max=max_sep)
 
-        # Combine the models
-        mod = gauss1 + gauss2 + bkg
-        init = mod.eval(pars, x=x)
-        out = mod.fit(y, pars, x=x)
+        params.add("sig1", value=5 if self.filter == "lrg" else 15, min=1, max=80)
+        params.add("sig2", value=10 if self.filter == "lrg" else 60, min=1, max=200)
 
-        # FWHM, fit components, and centroids for each Gaussian
-        fwhms = [2 * out.params['g1_sigma'] * np.sqrt(2 * np.log(2)), 2 * out.params['g2_sigma'] * np.sqrt(2 * np.log(2))]
-        centroids = [out.params['g1_center'].value, out.params['g2_center'].value]
-        amplitudes = [out.params['g1_height'].value, out.params['g2_height'].value]
-        comps = out.eval_components(x=x)
-        if centroids[0] < centroids[1]:
-            fwhm1 = fwhms[0]
-            fwhm2 = fwhms[1]
-            g1_fit = comps['g1_'] + comps['bkg_']
-            g2_fit = comps['g2_'] + comps['bkg_']
-            centroid1 = centroids[0]
-            centroid2 = centroids[1]
-            amp1 = amplitudes[0]
-            amp2 = amplitudes[1]
-        else:
-            fwhm1 = fwhms[1]
-            fwhm2 = fwhms[0]
-            g1_fit = comps['g2_'] + comps['bkg_']
-            g2_fit = comps['g1_'] + comps['bkg_']
-            centroid1 = centroids[1]
-            centroid2 = centroids[0]
-            amp1 = amplitudes[1]
-            amp2 = amplitudes[0]
+        params.add("amp1", value=amp_guess, min=-2.0, max=0.0)
+        params.add("amp2", value=amp_guess, min=-2.0, max=0.0)
 
-        idx1 = np.argmin(np.abs(x - centroid1))
-        idx2 = np.argmin(np.abs(x - centroid2))
+        minner = Minimizer(
+            double_gauss_linear_residual,
+            params,
+            fcn_args=(xfit, yfit)
+        )
 
-        diff = np.abs(out.best_fit[idx1] - y[idx1])
-        diff2 = np.abs(centroid2 - centroid1)
-        diff3 = out.best_fit[idx2] - out.best_fit[idx1]
+        result = minner.minimize(
+            method="least_squares",
+            loss="soft_l1"
+        )
+
+        p = result.params
+
+        cen1 = p["cen1"].value
+        cen2 = cen1 + p["sep"].value
+
+        telluric_pixel = min(cen1, cen2)
+
+        self.telluric_pixel = float(telluric_pixel)
+        self.telluric_fit_result = result
+        self.telluric_fit_kind = "double_minimizer"
+        self.telluric_fit_redchi = result.redchi
+
+        if self.filter == "hrg":
+            pmask = (
+                (self.spectrum[0] >= (self.telluric_pixel - 2500)) &
+                (self.spectrum[0] <= 4500)
+            )
+            self.pixel_mask = self.spectrum[0][pmask] - (self.telluric_pixel - 2500)
+            self.amp_uncal_mask = self.spectrum[1][pmask]
+
+        elif self.filter == "lrg":
+            pmask = (
+                (self.spectrum[0] >= (self.telluric_pixel - 1550)) &
+                (self.spectrum[0] <= 4500)
+            )
+            self.pixel_mask = self.spectrum[0][pmask] - (self.telluric_pixel - 1550)
+            self.amp_uncal_mask = self.spectrum[1][pmask]
 
         if debugging:
-
-            print('Fit Parameters:')
-            print(f'  Left Gaussian FWHM: {fwhm1:.2f} pixels')
-            print(f'  Left Gaussian Centroid: x = {centroid1:.2f}')
-            print(f' Left Gaussian Amplitude: {amp1:.2f}')
-            print(f' Right Gaussian Amplitude: {amp2:.2f}')
-            print(f'  Right Gaussian FWHM: {fwhm2:.2f} pixels')
-            print(f'  Right Gaussian Centroid: x = {centroid2:.2f}')
+            print("")
+            print("Telluric double-Gaussian minimizer fit")
+            print("--------------------------------------")
+            print(f"cen1      = {cen1:.3f}")
+            print(f"cen2      = {cen2:.3f}")
+            print(f"sep       = {p['sep'].value:.3f}")
+            print(f"fwhm1     = {2.354820045 * p['sig1'].value:.3f}")
+            print(f"fwhm2     = {2.354820045 * p['sig2'].value:.3f}")
+            print(f"amp1      = {p['amp1'].value:.4f}")
+            print(f"amp2      = {p['amp2'].value:.4f}")
+            print(f"redchi    = {result.redchi:.6g}")
             print('')
-            print(f'  Left Centroid Fit Value - Left Centroid Data Value [y]: {diff:.4f}')
-            print(f'  Centroid Difference [x]: {diff2:.2f}')
-            print(f'  Centroid Height Difference (right - left) [y]: {diff3:.4f}')
-
-            # Plotting for debugging
-            fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
-
-            # Left Plot: Data with Fitted Curve
-            axes[0].plot(x, y, label="Data", alpha=0.8)
-            axes[0].plot(x, out.best_fit, '-', label='Best Fit', color='black')
-            axes[0].legend()
-            axes[0].set_title("Data with Best Fit")
-
-            # Right Plot: Data with Individual Components Overlayed
-            axes[1].plot(x, y, label="Data", alpha=0.5)
-            axes[1].plot(x, g1_fit, '--', label='Gaussian 1 + Background', color='green')
-            axes[1].plot(x, g2_fit, '--', label='Gaussian 2 + Background', color='blue')
-            axes[1].plot(x, comps['bkg_'], '--', label='Background', color='orange')
-            axes[1].legend()
-            axes[1].set_title("Data with Component Fits Overlayed")
-
-            plt.tight_layout()
-            plt.show()
-
-        # diff = np.abs(out.best_fit[int(centroid1 - x[0])] - y[int(centroid1 - x[0])])
-        # diff2 = np.abs(centroid2 - centroid1)
-        # diff3 = out.best_fit[int(centroid2 - x[0])] - out.best_fit[int(centroid1 - x[0])]
-
-        if self.filter == 'hrg':
-
-            if (centroid1 - x[0]) < 0 or (centroid2 - x[0]) < 0 or (centroid1 - x[0]) > len(x) or (centroid2 - x[0]) > len(x):
-                if recursion < 10:
-                    # print('')
-                    # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset - 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
-                if recursion >= 10:
-                    # print('')
-                    # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset + 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
-
-            if fwhm1 < 10 or fwhm1 > 50 or diff > 0.2 or diff2 > 50 or diff3 < 0 or fwhm2 < 50 or fwhm2 > 500:
-                if recursion < 10:
-                    # print('')
-                    # print(f"Poor fit parameters, refitting at {x_guess + offset - 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
-                if recursion >= 10:
-                    # print('')
-                    # print(f"Poor fit parameters, refitting at {x_guess + offset + 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
-            
-            if np.abs(amp1) < 0.02 or np.abs(amp2) < 0.02 or np.abs(amp1) > 1 or np.abs(amp2) > 1:
-                if recursion < 10:
-                    # print('')
-                    # print(f"Poor fit amplitudes, refitting at {x_guess + offset - 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
-                if recursion >= 10:
-                    # print('')
-                    # print(f"Poor fit amplitudes, refitting at {x_guess + offset + 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
-            
-        if self.filter == 'lrg':
-            
-            if (centroid1 - x[0]) < 0 or (centroid2 - x[0]) < 0 or (centroid1 - x[0]) > len(x) or (centroid2 - x[0]) > len(x):
-                if recursion < 10:
-                    # print('')
-                    # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset - 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
-                if recursion >= 10:
-                    # print('')
-                    # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset + 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
-
-            if fwhm1 < 4 or fwhm1 > 20 or diff > 0.02 or diff2 > 20 or diff3 < -0.04 or fwhm2 < 1 or fwhm2 > 50:
-                if recursion < 10:
-                    # print('')
-                    # print(f"Poor fit parameters, refitting at {x_guess + offset - 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
-                if recursion >= 10:
-                    # print('')
-                    # print(f"Poor fit parameters, refitting at {x_guess + offset + 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
-            
-            if np.abs(amp1) < 0.03 or np.abs(amp2) < 0.03 or np.abs(amp1) > 1 or np.abs(amp2) > 1:
-                if recursion < 10:
-                    # print('')
-                    # print(f"Poor fit amplitudes, refitting at {x_guess + offset - 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
-                if recursion >= 10:
-                    # print('')
-                    # print(f"Poor fit amplitudes, refitting at {x_guess + offset + 10}")
-                    return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
+            print(f"Telluric Pixel: x = {telluric_pixel:.2f}")
 
         if plot:
+            model = double_gauss_linear_model(result.params, xfit)
 
-            # Plotting
-            fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
+            x0 = np.nanmedian(xfit)
+            bkg = p["c0"].value + p["c1"].value * (xfit - x0)
 
-            # Left Plot: Data with Fitted Curve
-            axes[0].plot(x, y, label="Data", alpha=0.8)
-            axes[0].plot(x, out.best_fit, '-', label='Best Fit', color='black')
+            g1 = bkg + p["amp1"].value * np.exp(
+                -0.5 * ((xfit - cen1) / p["sig1"].value) ** 2
+            )
+            g2 = bkg + p["amp2"].value * np.exp(
+                -0.5 * ((xfit - cen2) / p["sig2"].value) ** 2
+            )
+
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+            axes[0].plot(xfit, yfit, label="Data", alpha=0.8)
+            axes[0].plot(xfit, model, color="black", lw=2, label="Best fit")
+            axes[0].axvline(
+                telluric_pixel,
+                color="red",
+                ls=":",
+                label=f"Telluric Pixel: x = {telluric_pixel:.2f}"
+            )
+            axes[0].set_title("Telluric Double-Gaussian Fit")
+            axes[0].grid(alpha=0.3)
             axes[0].legend()
-            axes[0].set_title("Data with Best Fit")
 
-            # Right Plot: Data with Individual Components Overlayed
-            axes[1].plot(x, y, label="Data", alpha=0.5)
-            axes[1].plot(x, g1_fit, '--', label=f'Gaussian 1 + Bkg (Centroid: x = {out.params['g2_center'].value:.2f})', color='green')
-            axes[1].plot(x, g2_fit, '--', label=f'Gaussian 2 + Bkg (Centroid: x = {out.params['g1_center'].value:.2f})', color='blue')
-            axes[1].plot(x, comps['bkg_'], '--', label='Background', color='orange')
+            axes[1].plot(xfit, yfit, label="Data", alpha=0.5)
+            axes[1].plot(xfit, g1, "--", label=f"G1 + bkg ({cen1:.2f})")
+            axes[1].plot(xfit, g2, "--", label=f"G2 + bkg ({cen2:.2f})")
+            axes[1].plot(xfit, bkg, "--", label="Background")
+            axes[1].set_title("Components")
+            axes[1].grid(alpha=0.3)
             axes[1].legend()
-            axes[1].set_title("Data with Component Fits Overlayed")
 
             plt.tight_layout()
             plt.show()
 
-        # Return the previous outputs (wave_fit, fwhm1, fwhm2) along with r_squared_left
-        wave_fit = min(out.params['g1_center'].value, out.params['g2_center'].value)
-        self.telluric_pixel = wave_fit
+        return self.telluric_pixel
+    
+    # def fit_telluric(self, x_guess = None, recursion = None, offset = None, plot = False, debugging = False, manual_override = False):
 
-        if self.filter == 'hrg':
-            mask = (self.spectrum[0] >= (self.telluric_pixel - 2500)) & (self.spectrum[0] <= 4500)
-            self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 2500)
-            self.amp_uncal_mask = self.spectrum[1][mask]
-        if self.filter == 'lrg':
-            mask = (self.spectrum[0] >= (self.telluric_pixel - 1550)) & (self.spectrum[0] <= 4500)
-            self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 1550)
-            self.amp_uncal_mask = self.spectrum[1][mask]
+    #     x = self.spectrum[0]
+    #     y = self.spectrum[1]
 
-        return wave_fit
+    #     if manual_override:
+
+    #         self.telluric_pixel = x_guess
+
+    #         if self.filter == 'hrg':
+    #             mask = (self.spectrum[0] >= (self.telluric_pixel - 2500)) & (self.spectrum[0] <= 4500)
+    #             self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 2500)
+    #             self.amp_uncal_mask = self.spectrum[1][mask]
+    #         if self.filter == 'lrg':
+    #             mask = (self.spectrum[0] >= (self.telluric_pixel - 1550)) & (self.spectrum[0] <= 4500)
+    #             self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 1550)
+    #             self.amp_uncal_mask = self.spectrum[1][mask]
+
+    #         return self.telluric_pixel
+
+
+    #     if recursion is None:
+    #         recursion = 0
+
+    #     if self.camera == 'ASI Camer':
+    #         if self.filter == 'hrg':
+    #             x_guess = x_guess if x_guess else 3080
+    #             amp1, amp2 = -0.1, -0.1
+    #             mask = (x > x_guess - 150) & (x < x_guess + 150)
+    #         if self.filter == 'lrg':
+    #             x_guess = x_guess if x_guess else 3000
+    #             amp1, amp2 = -0.1, -0.1
+    #             mask = (x > x_guess - 80) & (x < x_guess + 80)
+    #     if self.camera == 'QHYCCD-Ca':
+    #         if self.filter == 'hrg':
+    #             x_guess = x_guess if x_guess else 2970
+    #             amp1, amp2 = -0.1, -0.1
+    #             mask = (x > x_guess - 150) & (x < x_guess + 150)
+    #         if self.filter == 'lrg':
+    #             x_guess = x_guess if x_guess else 2960
+    #             amp1, amp2 = -0.1, -0.1
+    #             mask = (x > x_guess - 50) & (x < x_guess + 50)
+
+    #     x = x[mask]
+    #     y = y[mask]/np.max(y[mask])
+
+    #     if offset is None:
+    #         offset = 0
+    #     if recursion == 10:
+    #         # print('Did not detect feature leftward of initial guess')
+    #         offset = 0
+    #     if recursion > 20:
+    #         print("Recursion limit reached, unable to fit feature")
+    #         return
+
+    #     # Define the left Gaussian (g1) model
+    #     gauss1 = GaussianModel(prefix='g1_')
+    #     pars = gauss1.make_params(center=x_guess + offset, sigma=5)
+    #     pars['g1_amplitude'].set(value=amp1, vary=True, max=0)
+
+    #     # Define the right Gaussian (g2) model
+    #     gauss2 = GaussianModel(prefix='g2_')
+    #     pars.update(gauss2.make_params(center=x_guess + 30 + offset, sigma=5))
+    #     pars['g2_amplitude'].set(value=amp2, vary=True, max=0)
+
+    #     # Define the background model
+    #     bkg = LinearModel(prefix='bkg_')
+    #     pars.update(bkg.guess(y, x))
+
+    #     # Combine the models
+    #     mod = gauss1 + gauss2 + bkg
+    #     init = mod.eval(pars, x=x)
+    #     out = mod.fit(y, pars, x=x)
+
+    #     # FWHM, fit components, and centroids for each Gaussian
+    #     fwhms = [2 * out.params['g1_sigma'] * np.sqrt(2 * np.log(2)), 2 * out.params['g2_sigma'] * np.sqrt(2 * np.log(2))]
+    #     centroids = [out.params['g1_center'].value, out.params['g2_center'].value]
+    #     amplitudes = [out.params['g1_height'].value, out.params['g2_height'].value]
+    #     comps = out.eval_components(x=x)
+    #     if centroids[0] < centroids[1]:
+    #         fwhm1 = fwhms[0]
+    #         fwhm2 = fwhms[1]
+    #         g1_fit = comps['g1_'] + comps['bkg_']
+    #         g2_fit = comps['g2_'] + comps['bkg_']
+    #         centroid1 = centroids[0]
+    #         centroid2 = centroids[1]
+    #         amp1 = amplitudes[0]
+    #         amp2 = amplitudes[1]
+    #     else:
+    #         fwhm1 = fwhms[1]
+    #         fwhm2 = fwhms[0]
+    #         g1_fit = comps['g2_'] + comps['bkg_']
+    #         g2_fit = comps['g1_'] + comps['bkg_']
+    #         centroid1 = centroids[1]
+    #         centroid2 = centroids[0]
+    #         amp1 = amplitudes[1]
+    #         amp2 = amplitudes[0]
+
+    #     idx1 = np.argmin(np.abs(x - centroid1))
+    #     idx2 = np.argmin(np.abs(x - centroid2))
+
+    #     diff = np.abs(out.best_fit[idx1] - y[idx1])
+    #     diff2 = np.abs(centroid2 - centroid1)
+    #     diff3 = out.best_fit[idx2] - out.best_fit[idx1]
+
+    #     if debugging:
+
+    #         print('Fit Parameters:')
+    #         print(f'  Left Gaussian FWHM: {fwhm1:.2f} pixels')
+    #         print(f'  Left Gaussian Centroid: x = {centroid1:.2f}')
+    #         print(f' Left Gaussian Amplitude: {amp1:.2f}')
+    #         print(f' Right Gaussian Amplitude: {amp2:.2f}')
+    #         print(f'  Right Gaussian FWHM: {fwhm2:.2f} pixels')
+    #         print(f'  Right Gaussian Centroid: x = {centroid2:.2f}')
+    #         print('')
+    #         print(f'  Left Centroid Fit Value - Left Centroid Data Value [y]: {diff:.4f}')
+    #         print(f'  Centroid Difference [x]: {diff2:.2f}')
+    #         print(f'  Centroid Height Difference (right - left) [y]: {diff3:.4f}')
+
+    #         # Plotting for debugging
+    #         fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
+
+    #         # Left Plot: Data with Fitted Curve
+    #         axes[0].plot(x, y, label="Data", alpha=0.8)
+    #         axes[0].plot(x, out.best_fit, '-', label='Best Fit', color='black')
+    #         axes[0].legend()
+    #         axes[0].set_title("Data with Best Fit")
+
+    #         # Right Plot: Data with Individual Components Overlayed
+    #         axes[1].plot(x, y, label="Data", alpha=0.5)
+    #         axes[1].plot(x, g1_fit, '--', label='Gaussian 1 + Background', color='green')
+    #         axes[1].plot(x, g2_fit, '--', label='Gaussian 2 + Background', color='blue')
+    #         axes[1].plot(x, comps['bkg_'], '--', label='Background', color='orange')
+    #         axes[1].legend()
+    #         axes[1].set_title("Data with Component Fits Overlayed")
+
+    #         plt.tight_layout()
+    #         plt.show()
+
+    #     # diff = np.abs(out.best_fit[int(centroid1 - x[0])] - y[int(centroid1 - x[0])])
+    #     # diff2 = np.abs(centroid2 - centroid1)
+    #     # diff3 = out.best_fit[int(centroid2 - x[0])] - out.best_fit[int(centroid1 - x[0])]
+
+    #     if self.filter == 'hrg':
+
+    #         if (centroid1 - x[0]) < 0 or (centroid2 - x[0]) < 0 or (centroid1 - x[0]) > len(x) or (centroid2 - x[0]) > len(x):
+    #             if recursion < 10:
+    #                 # print('')
+    #                 # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset - 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
+    #             if recursion >= 10:
+    #                 # print('')
+    #                 # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset + 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
+
+    #         if fwhm1 < 10 or fwhm1 > 50 or diff > 0.2 or diff2 > 50 or diff3 < 0 or fwhm2 < 45 or fwhm2 > 500:
+    #             if recursion < 10:
+    #                 # print('')
+    #                 # print(f"Poor fit parameters, refitting at {x_guess + offset - 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
+    #             if recursion >= 10:
+    #                 # print('')
+    #                 # print(f"Poor fit parameters, refitting at {x_guess + offset + 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
+            
+    #         if np.abs(amp1) < 0.02 or np.abs(amp2) < 0.02 or np.abs(amp1) > 1 or np.abs(amp2) > 1:
+    #             if recursion < 10:
+    #                 # print('')
+    #                 # print(f"Poor fit amplitudes, refitting at {x_guess + offset - 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
+    #             if recursion >= 10:
+    #                 # print('')
+    #                 # print(f"Poor fit amplitudes, refitting at {x_guess + offset + 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
+            
+    #     if self.filter == 'lrg':
+            
+    #         if (centroid1 - x[0]) < 0 or (centroid2 - x[0]) < 0 or (centroid1 - x[0]) > len(x) or (centroid2 - x[0]) > len(x):
+    #             if recursion < 10:
+    #                 # print('')
+    #                 # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset - 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
+    #             if recursion >= 10:
+    #                 # print('')
+    #                 # print(f"Poor fit (centroid out of bounds), refitting at {x_guess + offset + 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
+
+    #         if fwhm1 < 4 or fwhm1 > 20 or diff > 0.04 or diff2 > 15 or diff3 < -0.03 or fwhm2 < 1 or fwhm2 > 50:
+    #             if recursion < 10:
+    #                 # print('')
+    #                 # print(f"Poor fit parameters, refitting at {x_guess + offset - 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
+    #             if recursion >= 10:
+    #                 # print('')
+    #                 # print(f"Poor fit parameters, refitting at {x_guess + offset + 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
+            
+    #         if np.abs(amp1) < 0.03 or np.abs(amp2) < 0.03 or np.abs(amp1) > 1 or np.abs(amp2) > 1:
+    #             if recursion < 10:
+    #                 # print('')
+    #                 # print(f"Poor fit amplitudes, refitting at {x_guess + offset - 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset - 5, plot = plot, debugging = debugging)
+    #             if recursion >= 10:
+    #                 # print('')
+    #                 # print(f"Poor fit amplitudes, refitting at {x_guess + offset + 10}")
+    #                 return self.fit_telluric(x_guess=x_guess, recursion = recursion + 1, offset = offset + 5, plot = plot, debugging = debugging)
+
+    #     if plot:
+
+    #         # Plotting
+    #         fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
+
+    #         # Left Plot: Data with Fitted Curve
+    #         axes[0].plot(x, y, label="Data", alpha=0.8)
+    #         axes[0].plot(x, out.best_fit, '-', label='Best Fit', color='black')
+    #         axes[0].legend()
+    #         axes[0].set_title("Data with Best Fit")
+
+    #         # Right Plot: Data with Individual Components Overlayed
+    #         axes[1].plot(x, y, label="Data", alpha=0.5)
+    #         axes[1].plot(x, g1_fit, '--', label=f'Gaussian 1 + Bkg (Centroid: x = {out.params['g2_center'].value:.2f})', color='green')
+    #         axes[1].plot(x, g2_fit, '--', label=f'Gaussian 2 + Bkg (Centroid: x = {out.params['g1_center'].value:.2f})', color='blue')
+    #         axes[1].plot(x, comps['bkg_'], '--', label='Background', color='orange')
+    #         axes[1].legend()
+    #         axes[1].set_title("Data with Component Fits Overlayed")
+
+    #         plt.tight_layout()
+    #         plt.show()
+
+    #     # Return the previous outputs (wave_fit, fwhm1, fwhm2) along with r_squared_left
+    #     wave_fit = min(out.params['g1_center'].value, out.params['g2_center'].value)
+    #     self.telluric_pixel = wave_fit
+
+    #     if self.filter == 'hrg':
+    #         mask = (self.spectrum[0] >= (self.telluric_pixel - 2500)) & (self.spectrum[0] <= 4500)
+    #         self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 2500)
+    #         self.amp_uncal_mask = self.spectrum[1][mask]
+    #     if self.filter == 'lrg':
+    #         mask = (self.spectrum[0] >= (self.telluric_pixel - 1550)) & (self.spectrum[0] <= 4500)
+    #         self.pixel_mask = self.spectrum[0][mask] - (self.telluric_pixel - 1550)
+    #         self.amp_uncal_mask = self.spectrum[1][mask]
+
+    #     return wave_fit
     
 
     def wavelength_calibrate(self, plot = False):
@@ -987,39 +1562,84 @@ class spectrum:
 
         return waves
     
-    def gain_calibrate(self, plot = False):
+    def gain_calibrate(self, plot=False):
 
-        waves = self.waves
-        amp_uncal_mask = self.amp_uncal_mask
-        gain_spline = self.gain_spline
-        gain_curve = gain_spline(waves)
+        wave_grid = np.asarray(self.waves, dtype=float)
+        amp_uncal_mask = np.asarray(self.amp_uncal_mask, dtype=float)
 
-        cal_spec = amp_uncal_mask/gain_curve
+        calib_wave = np.asarray(self.calib_spectrum.wave_grid, dtype=float)
+        calib_gain = np.asarray(self.calib_spectrum.gain_smooth, dtype=float)
+
+        # Clean and sort calibration gain curve
+        good = np.isfinite(calib_wave) & np.isfinite(calib_gain)
+        calib_wave = calib_wave[good]
+        calib_gain = calib_gain[good]
+
+        order = np.argsort(calib_wave)
+        calib_wave = calib_wave[order]
+        calib_gain = calib_gain[order]
+
+        # Interpolate calibration gain onto science wavelength grid
+        gain_curve = np.interp(
+            wave_grid,
+            calib_wave,
+            calib_gain,
+            left=np.nan,
+            right=np.nan
+        )
+
+        valid = np.isfinite(wave_grid) & np.isfinite(amp_uncal_mask) & np.isfinite(gain_curve) & (gain_curve != 0)
+
+        cal_spec = np.full_like(amp_uncal_mask, np.nan, dtype=float)
+        cal_spec[valid] = amp_uncal_mask[valid] / gain_curve[valid]
 
         xlow, xhigh = self.wavelength_range
-        mask = (waves >= xlow) & (waves <= xhigh)
+        mask = (wave_grid >= xlow) & (wave_grid <= xhigh) & valid
 
-        norm_gain_curve = gain_curve/np.max(gain_curve[mask])
-        norm_cal_spec = cal_spec/np.max(cal_spec[mask])
+        if not np.any(mask):
+            raise ValueError("No valid wavelength overlap between science spectrum and calibration gain curve.")
+
+        norm_gain_curve = gain_curve / np.nanmax(gain_curve[mask])
+        norm_cal_spec = cal_spec / np.nanmax(cal_spec[mask])
 
         if plot:
-            plt.figure(figsize = (12,6))
+            plt.figure(figsize=(12, 6))
 
-            plt.plot(waves[mask], amp_uncal_mask[mask]/np.max(amp_uncal_mask[mask]), color = 'blue', label = 'Uncalibrated Spectrum')
-            plt.plot(waves[mask], norm_gain_curve[mask], color = 'red', label = 'Gain Curve')
-            plt.plot(waves[mask], norm_cal_spec[mask], color = 'purple', label = 'Calibrated Spectrum')
+            plt.plot(
+                wave_grid[mask],
+                amp_uncal_mask[mask] / np.nanmax(amp_uncal_mask[mask]),
+                color='blue',
+                label='Uncalibrated Spectrum'
+            )
+            plt.plot(
+                wave_grid[mask],
+                norm_gain_curve[mask],
+                color='red',
+                label='Interpolated Gain Curve'
+            )
+            plt.plot(
+                wave_grid[mask],
+                norm_cal_spec[mask],
+                color='purple',
+                label='Calibrated Spectrum'
+            )
+
             plt.xlabel('Wavelength (Å)')
             plt.ylabel('Normalized Flux')
             plt.title('Flux Calibrated Spectrum')
-            
-            # plt.xlim(xlow, xhigh)
-            plt.ylim(np.min(norm_cal_spec[mask]) - np.std(norm_cal_spec[mask]), np.max(norm_gain_curve[mask]) + np.std(norm_gain_curve[mask]))
+
+            plt.ylim(
+                np.nanmin(norm_cal_spec[mask]) - np.nanstd(norm_cal_spec[mask]),
+                np.nanmax(norm_gain_curve[mask]) + np.nanstd(norm_gain_curve[mask])
+            )
 
             plt.tight_layout()
             plt.legend()
             plt.show()
 
+        self.gain_curve = gain_curve
         self.cal_spec = cal_spec
+        self.cal_spec_norm = cal_spec / np.nanmedian(cal_spec[mask])
 
         return self.cal_spec
 
@@ -1135,271 +1755,6 @@ class spectrum:
 
         return flux_conv
     
-    # def voigt_centroid(self, x, y, x0, window):
-    #     """
-    #     Fit a Voigt profile near x0 and return the centroid.
-
-    #     Parameters
-    #     ----------
-    #     x : array
-    #         Pixel or wavelength array
-    #     y : array
-    #         Flux array (absorption line)
-    #     x0 : float
-    #         Initial guess (pixel or wavelength)
-    #     window : int
-    #         Half-width of fit window in x units
-
-    #     Returns
-    #     -------
-    #     center : float
-    #         Fitted centroid
-    #     center_err : float or None
-    #         1σ uncertainty (if available)
-    #     result : lmfit result object
-    #     """
-
-    #     idx = np.argmin(np.abs(x - x0))
-    #     lo = max(idx - window, 0)
-    #     hi = min(idx + window + 1, len(x))
-
-    #     xfit = x[lo:hi]
-    #     yfit = y[lo:hi]
-
-    #     # Absorption line → invert for lmfit peak models
-    #     yfit_inv = np.max(yfit) - yfit
-
-    #     voigt = VoigtModel(prefix='v_')
-    #     cont = LinearModel(prefix='c_')
-    #     model = voigt + cont
-
-    #     params = model.make_params()
-
-    #     params['v_center'].set(value=x0, min=xfit.min(), max=xfit.max())
-    #     params['v_sigma'].set(value=1.0, min=0.1)
-    #     params['v_gamma'].set(value=1.0, min=0.1)
-    #     params['v_amplitude'].set(value=np.trapz(yfit_inv, xfit), min=0)
-
-    #     # params['c_c'].set(value=np.median(yfit_inv))
-    #     params.update(cont.guess(yfit_inv, x=xfit))
-
-    #     result = model.fit(yfit_inv, params, x=xfit)
-
-    #     center = result.params['v_center'].value
-    #     center_err = result.params['v_center'].stderr
-
-    #     return center, center_err
-
-    def voigt_centroid(
-        self,
-        x,
-        y,
-        x0,
-        window=6,
-        window_try=None,
-        min_snr=3.0,
-        max_center_shift=None,
-        return_result=False,
-        debug=False
-    ):
-        """
-        Robust centroid of an absorption feature using Voigt + linear continuum.
-
-        Parameters
-        ----------
-        x, y : array-like
-            Spectrum coordinates and flux.
-        x0 : float
-            Initial guess for centroid.
-        window : int
-            Default half-window in x units if window_try is None.
-        window_try : list[int] or None
-            Candidate half-window sizes to try. Best acceptable fit is chosen.
-        min_snr : float
-            Minimum approximate line SNR required for accepting a Voigt fit.
-        max_center_shift : float or None
-            Maximum allowed |center - x0|. If None, defaults to ~0.75*window.
-        return_result : bool
-            If True, also return best lmfit result and diagnostics dict.
-        debug : bool
-            Print diagnostics.
-
-        Returns
-        -------
-        center : float
-        center_err : float
-        result : lmfit result, optional
-        info : dict, optional
-        """
-        from lmfit.models import VoigtModel, LinearModel
-        import numpy as np
-
-        x = np.asarray(x, dtype=float)
-        y = np.asarray(y, dtype=float)
-
-        if window_try is None:
-            window_try = sorted(set([max(3, window-2), window, window+2, window+4]))
-
-        if max_center_shift is None:
-            max_center_shift = 0.75 * max(window_try)
-
-        best = None
-        best_score = np.inf
-        diagnostics = []
-
-        for w in window_try:
-            idx = np.argmin(np.abs(x - x0))
-            lo = max(idx - w, 0)
-            hi = min(idx + w + 1, len(x))
-
-            xfit = x[lo:hi]
-            yfit = y[lo:hi]
-
-            if len(xfit) < 7:
-                continue
-            if not np.all(np.isfinite(xfit)) or not np.all(np.isfinite(yfit)):
-                continue
-
-            dx = np.median(np.diff(xfit)) if len(xfit) > 2 else 1.0
-            if not np.isfinite(dx) or dx <= 0:
-                dx = 1.0
-
-            # approximate line depth / noise using edge pixels as pseudo-continuum
-            nedge = max(2, len(yfit) // 5)
-            edge_y = np.concatenate([yfit[:nedge], yfit[-nedge:]])
-            cont_med = np.median(edge_y)
-            noise = np.std(edge_y) if len(edge_y) > 1 else np.std(yfit)
-            noise = max(noise, 1e-12)
-
-            line_depth = cont_med - np.min(yfit)   # absorption depth
-            approx_snr = line_depth / noise
-
-            # absorption -> positive peak for Voigt
-            yinv = np.max(yfit) - yfit
-
-            voigt = VoigtModel(prefix='v_')
-            cont = LinearModel(prefix='c_')
-            model = voigt + cont
-
-            pars = model.make_params()
-            pars['v_center'].set(value=x0, min=xfit.min(), max=xfit.max())
-            pars['v_sigma'].set(value=max(1.5 * dx, 0.5 * dx), min=0.25 * dx, max=10 * dx)
-            pars['v_gamma'].set(value=max(1.5 * dx, 0.5 * dx), min=0.25 * dx, max=10 * dx)
-            pars['v_amplitude'].set(value=max(np.trapz(yinv, xfit), 1e-12), min=0)
-
-            # let continuum be guessed from inverted spectrum
-            pars.update(cont.guess(yinv, x=xfit))
-
-            try:
-                result = model.fit(
-                    yinv,
-                    pars,
-                    x=xfit,
-                    method='least_squares',
-                    fit_kws={'loss': 'soft_l1'}
-                )
-            except Exception:
-                continue
-
-            center = result.params['v_center'].value
-            center_err = result.params['v_center'].stderr
-            sigma = result.params['v_sigma'].value
-            gamma = result.params['v_gamma'].value
-
-            best_fit = result.best_fit
-            resid = yinv - best_fit
-            rms = np.sqrt(np.mean(resid**2))
-
-            # approximate reduced chi-like score
-            red_metric = np.mean((resid / noise)**2)
-
-            # fit acceptance
-            bad = False
-            if not np.isfinite(center):
-                bad = True
-            if abs(center - x0) > max_center_shift:
-                bad = True
-            if not np.isfinite(sigma) or not np.isfinite(gamma):
-                bad = True
-            if sigma < 0.2 * dx or gamma < 0.2 * dx:
-                bad = True
-            if approx_snr < min_snr:
-                bad = True
-
-            diagnostics.append({
-                "window": w,
-                "center": center,
-                "center_err": center_err,
-                "snr": approx_snr,
-                "rms": rms,
-                "red_metric": red_metric,
-                "accepted": not bad,
-            })
-
-            if bad:
-                continue
-
-            # prefer low residual and small center error
-            err_term = center_err if (center_err is not None and np.isfinite(center_err)) else 5 * dx
-            score = red_metric + 0.2 * (err_term / dx)
-
-            if score < best_score:
-                best_score = score
-                best = (center, err_term, result, {
-                    "window": w,
-                    "snr": approx_snr,
-                    "rms": rms,
-                    "red_metric": red_metric,
-                })
-
-        # fallback: weighted centroid around local absorption minimum
-        if best is None:
-            idx = np.argmin(np.abs(x - x0))
-            lo = max(idx - window, 0)
-            hi = min(idx + window + 1, len(x))
-
-            xfit = x[lo:hi]
-            yfit = y[lo:hi]
-
-            if len(xfit) < 3:
-                center = float(x0)
-                center_err = np.inf
-            else:
-                nedge = max(2, len(yfit) // 5)
-                edge_y = np.concatenate([yfit[:nedge], yfit[-nedge:]])
-                cont = np.median(edge_y)
-                weights = np.clip(cont - yfit, 0, None)  # absorption-only weights
-
-                if np.sum(weights) > 0:
-                    center = float(np.sum(xfit * weights) / np.sum(weights))
-                    center_err = float(np.std(xfit) / max(np.sqrt(np.sum(weights > 0)), 1))
-                else:
-                    center = float(xfit[np.argmin(yfit)])
-                    center_err = np.inf
-
-            if debug:
-                print(f"voigt_centroid fallback used at x0={x0:.2f}")
-
-            if return_result:
-                return center, center_err, None, {"fallback": True, "trials": diagnostics}
-            return center, center_err
-
-        center, center_err, result, info = best
-
-        if debug:
-            print(
-                f"voigt_centroid x0={x0:.2f} -> center={center:.3f}, "
-                f"err={center_err:.3f}, window={info['window']}, "
-                f"SNR={info['snr']:.2f}, red_metric={info['red_metric']:.3f}"
-            )
-
-        if return_result:
-            info["fallback"] = False
-            info["trials"] = diagnostics
-            return center, center_err, result, info
-
-        return center, center_err
-    
     def derive_wavelength_solution(self, show_points = False, plot = False):
 
         filter = self.filter
@@ -1413,35 +1768,35 @@ class spectrum:
         if filter == 'hrg':
             telluric_x = 2500
             if cal_star in ['hr 718','HR 718', 'hr 4468', 'HR 4468']:
-                wavelengths = [6279.0, 6347.11, 6371.37, 6562.819, 6872.0]
+                wavelengths = [6280.2, 6347.11, 6371.37, 6562.819, 6873.0]
                 pixel_guesses = [telluric_x - 1292, telluric_x - 1136, telluric_x - 1081, telluric_x - 652, telluric_x]
                 wavelength_labels = [r"O$_2$ $\gamma$ band", r"Si II 6347", r"Si II 6371", r"H$\alpha$", r"O$_2$ B band"]
             if cal_star in ['hr 3454', 'HR 3454']:
-                wavelengths = [5875.62510, 6279.0, 6347.11, 6562.819, 6678.15174, 6872.0] 
+                wavelengths = [5875.62510, 6280.2, 6347.11, 6562.819, 6678.15174, 6873.0] 
                 wavelength_labels = [r"He I 5876", r"O$_2$ $\gamma$ band", r"Si II 6347", r"H$\alpha$", r"He I 6678", r"O$_2$ B band"]
                 pixel_guesses = [telluric_x - 2306, telluric_x - 1292, telluric_x - 1136, telluric_x - 652, telluric_x - 405, telluric_x]
             if cal_star in ['hr 4963', 'HR 4963']:
-                wavelengths = [5889.95094, 6279.0, 6347.11, 6371.37, 6562.819, 6872.0] 
+                wavelengths = [5889.95094, 6280.2, 6347.11, 6371.37, 6562.819, 6873.0] 
                 wavelength_labels = [r"Na I 5890", r"O$_2$ $\gamma$ band", r"Si II 6347", r"Si II 6371", r"H$\alpha$", r"O$_2$ B band"]
                 pixel_guesses = [telluric_x - 2269, telluric_x - 1292, telluric_x - 1136, telluric_x - 1081, telluric_x - 652, telluric_x]
             if cal_star in ['hr 7589', 'HR 7589']:
-                wavelengths = [5875.62510, 6279.0, 6560.14160, 6678.15174, 6872.0] 
+                wavelengths = [5875.62510, 6280.2, 6560.14160, 6678.15174, 6873.0] 
                 wavelength_labels = [r"He I 5876", r"O$_2$ $\gamma$ band", r"He I 6678",r"He I 6560", r"O$_2$ B band"]
                 pixel_guesses = [telluric_x - 2306, telluric_x - 1288, telluric_x - 657, telluric_x - 405, telluric_x]
         if filter == 'lrg':
             if self.camera == 'ASI Camer':
                 telluric_x = 1550
                 if cal_star in ['hr 718', 'HR 718','hr 3454', 'HR 3454', 'hr 4468', 'HR 4468','hr 4963', 'HR 4963']:
-                    wavelengths = [3970.0788, 4101.7415, 4340.471, 4861.333, 6562.819, 6872.0, 7607.5]
+                    wavelengths = [3970.0788, 4101.7415, 4340.471, 4861.333, 6562.819, 6873.0, 7607.5]
                     wavelength_labels = [r"H$\epsilon$", r"H$\delta$", r"H$\gamma$", r"H$\beta$", r"H$\alpha$", r"O$_2$ B band", r"O$_2$ A band"]
                     pixel_guesses = [telluric_x - 1312, telluric_x - 1246, telluric_x - 1132, telluric_x - 887, telluric_x - 133, telluric_x, telluric_x + 316]
-                    # wavelengths = [3970.0788, 4101.7415, 4861.333, 4921.931036, 6562.819, 6872.0, 7607.5]
+                    # wavelengths = [3970.0788, 4101.7415, 4861.333, 4921.931036, 6562.819, 6873.0, 7607.5]
                     # wavelength_labels = [r"H$\epsilon$", r"H$\delta$", r"H$\beta$", r"He I 4922", r"H$\alpha$", r"O$_2$ B band", r"O$_2$ A band"]
                     # pixel_guesses = [telluric_x - 1312, telluric_x - 1246, telluric_x - 887, telluric_x - 860, telluric_x - 133, telluric_x, telluric_x + 316]
             if self.camera == 'QHYCCD-Ca':
                 telluric_x = 1550
                 if cal_star in ['hr 718', 'HR 718','hr 3454', 'HR 3454', 'hr 4468', 'HR 4468','hr 4963', 'HR 4963']:
-                    wavelengths = [3970.0788, 4101.7415, 4340.471, 4861.333, 6562.819, 6872.0, 7607.5]
+                    wavelengths = [3970.0788, 4101.7415, 4340.471, 4861.333, 6562.819, 6873.0, 7607.5]
                     wavelength_labels = [r"H$\epsilon$", r"H$\delta$", r"H$\gamma$", r"H$\beta$", r"H$\alpha$", r"O$_2$ B band", r"O$_2$ A band"]
                     pixel_guesses = [telluric_x - 1290, telluric_x - 1225, telluric_x - 1112, telluric_x - 872, telluric_x - 133, telluric_x, telluric_x + 316]
         
@@ -1449,7 +1804,7 @@ class spectrum:
         wavelength_errors = []
 
         for wavelength in wavelengths:
-            if wavelength not in [6279.0, 6872.0, 7607.5]:
+            if wavelength not in [6280.2, 6873.0, 7607.5]:
                 wavelength_centroids.append(wavelength*wavelength_correction)
                 wavelength_errors.append(0.05)
             else:
@@ -1467,7 +1822,7 @@ class spectrum:
                 # if pixel_guess == telluric_x - 652:
                 #     center, err = self.voigt_centroid(x = pixel_mask, y = amp_uncal_mask, x0 = pixel_guess, window = 8)
                 # else:
-                center, err = self.voigt_centroid(x = pixel_mask, y = amp_uncal_mask, x0 = pixel_guess, window = 6)
+                center, err = voigt_centroid(x = pixel_mask, y = amp_uncal_mask, x0 = pixel_guess, window = 6)
                 pixel_centroids.append(center)
                 pixel_errors.append(err)
 
@@ -1549,7 +1904,7 @@ class spectrum:
             for lbl in line_labels
             ])
             O2_mask = np.array([
-                ("O$_2$ $\gamma$ band" in str(lbl))
+                (r"O$_2$ $\gamma$ band" in str(lbl))
                 for lbl in line_labels
             ])
             if np.any(halpha_mask):
